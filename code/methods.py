@@ -989,3 +989,98 @@ def CBCD_path_preload(lambda_penalized_range, y, M_all,c_all,blocks,
         
     return w_res, z_res, solves, losses
 
+
+
+# code for optimal method
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.linalg import spsolve
+
+@jit(nopython=True)
+def get_regression_cost_subgradient(X,y,s,lambda_ridge):
+    """
+    Must all be numpy arrays
+    """
+    p = X.shape[1]
+    X_sub = X[:,s==1]
+    
+    alpha_star = y - X_sub@np.linalg.inv(np.diag(np.ones(np.sum(s))/lambda_ridge) + \
+                                  np.transpose(X_sub)@X_sub)@np.transpose(X_sub)@y
+    
+    c = 0.5*y@alpha_star
+    
+    subgradients = np.zeros(p)
+    for j in range(0,p):
+        subgradients[j] = -lambda_ridge*0.5 *(X[:,j]@alpha_star)**2
+    
+    return c, alpha_star , subgradients
+
+def get_regression_cost_subgradient_sp(X, y, s, lambda_ridge):
+    p = X.shape[1]
+    X_sub = X[:, s == 1]  
+
+    if X_sub.shape[1] > 0: 
+
+        I_lambda = sp.eye(X_sub.shape[1]) / lambda_ridge
+        XtX = X_sub.T @ X_sub  
+        rhs = X_sub.T @ y 
+        alpha_star = y - X_sub @ spsolve(I_lambda + XtX, rhs)  
+    else:
+        alpha_star = y  
+
+    c = 0.5 * (y.T @ alpha_star).item()
+
+
+    subgradients = np.zeros(p)
+    X_alpha = X.T @ alpha_star 
+
+    for j in range(p):
+        subgradients[j] = -0.5 * lambda_ridge * (X_alpha[j]) ** 2 
+
+    return c, alpha_star, subgradients
+
+def solve_optimal_single(M_ensemble,y, blocks,c_ensemble,nonzero, lambda_ridge,tol = 10**-3):
+    regressor = gp.Model()
+    regressor.params.OutputFlag = 0
+    regressor.params.timelimit = 600
+    regressor.params.mipgap = 0.001    
+
+    dim = M_ensemble.shape[1]
+    nu = regressor.addVar(name="nu") 
+    z_new = regressor.addVars(dim, vtype=GRB.BINARY, name="z_new") 
+
+    regressor.setObjective(nu, GRB.MINIMIZE)
+    regressor.addConstr(nu>=0)
+    
+    for t in range(ntrees):
+        z_inds = np.array(blocks[t])
+        for i in z_inds:
+            regressor.addConstr(gp.quicksum([z_new[j] for j in z_inds[c_ensemble[i]]]) <= (1 - z_new[i])*len(c_ensemble[i]))
+
+    regressor.addConstr(gp.quicksum(z_new) <= nonzero)
+
+    t1 = time.time()
+    cost = 10**9
+    nu1 = 0
+    while  (nu1 - cost)/cost < -tol:
+        regressor.optimize()
+        z = np.array([z_new[i].X for i in range(dim)])
+        nu1 = nu.X
+        z= z.astype(int)
+        cost, alpha_star, subgradient = get_regression_cost_subgradient_sp(M_ensemble ,y,z,lambda_ridge)
+        regressor.addConstr(nu >= cost + quicksum([ subgradient[i]*(z_new[i] -z[i]) for i in range(dim)]))
+
+        print(nu1,cost)
+    t2 = time.time()
+
+    print('time:', t2-t1)
+    M_sub = np.array(M_ensemble.todense().astype(float))[:,z==1]
+
+    ### compute w
+    inv = np.linalg.inv(np.transpose(M_sub)@M_sub + np.diag(np.ones(np.sum(z))/lambda_ridge))
+    w_sub = inv@np.transpose(M_sub)@y
+    w = np.zeros(len(z))
+    w[z==1] = w_sub
+
+    return(w,z)
+
